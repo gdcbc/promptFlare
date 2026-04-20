@@ -5,9 +5,9 @@ import torch
 
 @dataclass
 class Config:
-    model_id: str = r"D:\huggingface\models--runwayml--stable-diffusion-v1-5\snapshots\451f4fe16113bff5a5d2269ed5ad43b0592e9a14"
-    image_dir: str = r"E:\pythonproject\PromptFlare-main\image_512"
-    output_dir: str = r"E:\pythonproject\PromptFlare-main\flare_i2i_output"
+    model_id: str = r"E:\huggingface\hub\models--runwayml--stable-diffusion-v1-5\snapshots\451f4fe16113bff5a5d2269ed5ad43b0592e9a14"
+    image_dir: str = r"E:\PythonProject\promptFlare\image_512"
+    output_dir: str = r"E:\PythonProject\promptFlare\flare_i2i_output"
 
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

@@ -1,7 +1,6 @@
 import os
 import gc
 
-# 建议放在 import torch 前
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
 import torch
@@ -19,7 +18,6 @@ from utils import (
     sample_timestep_positions,
     set_seed,
     soft_time_gate,
-    tensor_to_pil,
     total_variation,
 )
 
@@ -29,9 +27,6 @@ class FlareI2ITrainer:
         self.cfg = cfg
         self.device = torch.device(cfg.device)
         ensure_dir(cfg.output_dir)
-
-        # 默认不验证，只保留最终保护图
-        self.run_validation = getattr(cfg, "run_validation", False)
 
         print("[*] Loading pipeline...")
         pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
@@ -43,7 +38,6 @@ class FlareI2ITrainer:
         pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
         pipe = pipe.to(self.device)
 
-        # 显存优化
         try:
             pipe.enable_attention_slicing()
             print("[*] attention slicing enabled.")
@@ -75,12 +69,10 @@ class FlareI2ITrainer:
         self.unet = pipe.unet.eval()
         self.scheduler = pipe.scheduler
 
-        # 冻结参数，只优化 delta
         self.text_encoder.requires_grad_(False)
         self.vae.requires_grad_(False)
         self.unet.requires_grad_(False)
 
-        # 保持半精度/单精度与 config 一致
         self.text_encoder.to(dtype=cfg.infer_dtype)
         self.vae.to(dtype=cfg.infer_dtype)
         self.unet.to(dtype=cfg.infer_dtype)
@@ -94,7 +86,6 @@ class FlareI2ITrainer:
         self.recorder = CrossAttentionRecorder()
         self._install_flare_processors()
 
-        # 缓存 quality prompt embedding，避免反复编码
         self.cached_quality_prompt_embeds = self.encode_prompt(cfg.quality_prompt)
 
         print("[*] Ready.")
@@ -119,7 +110,6 @@ class FlareI2ITrainer:
         if not self.cfg.exclude_outermost:
             return True
 
-        # 排除最外层高分辨率 attention，节省显存
         if "down_blocks.0" in name:
             return False
         if "up_blocks.3" in name:
@@ -185,7 +175,6 @@ class FlareI2ITrainer:
             zt = self.scheduler.add_noise(z0, base_noise, timestep)
             zt = self.scheduler.scale_model_input(zt, timestep)
 
-            # 先跑 BOS-only 分支，不保留梯度，作为 target
             self.recorder.clear()
             self.recorder.set_mode("bos")
             with torch.no_grad():
@@ -196,7 +185,6 @@ class FlareI2ITrainer:
                     return_dict=True,
                 ).sample
 
-            # 再跑 full 分支，保留梯度
             self.recorder.set_mode("full")
             _ = self.unet(
                 zt,
@@ -229,7 +217,6 @@ class FlareI2ITrainer:
         image_name = os.path.splitext(os.path.basename(image_path))[0]
         print(f"\n[*] Training on {image_name}")
 
-        # delta 用 float32 更稳
         clean = load_image_tensor(image_path, cfg.image_size).to(
             self.device,
             dtype=torch.float32,
@@ -290,71 +277,13 @@ class FlareI2ITrainer:
 
         final_protected = (clean + best_delta).clamp(0, 1)
 
-        # 只保存最终保护图
         save_image(final_protected, os.path.join(image_out_dir, "protected_final.png"))
-
         print(f"[*] Best loss for {image_name}: {best_loss:.6f}")
-
-        # 默认关闭验证；需要时在 config.py 里加 run_validation = True
-        if self.run_validation:
-            try:
-                self.validate_one_image(
-                    clean=clean,
-                    protected=final_protected,
-                    image_name=image_name,
-                    save_dir=os.path.join(image_out_dir, "validation"),
-                )
-            except Exception as e:
-                print(f"[!] Validation failed on {image_name}: {e}")
+        print(f"[*] Saved: {os.path.join(image_out_dir, 'protected_final.png')}")
 
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-    @torch.no_grad()
-    def validate_one_image(
-        self,
-        clean: torch.Tensor,
-        protected: torch.Tensor,
-        image_name: str,
-        save_dir: str,
-    ):
-        ensure_dir(save_dir)
-
-        clean_pil = tensor_to_pil(clean)
-        protected_pil = tensor_to_pil(protected)
-        clean_pil.save(os.path.join(save_dir, f"{image_name}_clean.png"))
-        protected_pil.save(os.path.join(save_dir, f"{image_name}_protected.png"))
-
-        for strength in self.cfg.validate_strengths:
-            for cfg_scale in self.cfg.validate_cfg_scales:
-                for idx, prompt in enumerate(self.cfg.validate_prompts):
-                    gen_clean = torch.Generator(device=self.device).manual_seed(self.cfg.seed)
-                    gen_protected = torch.Generator(device=self.device).manual_seed(self.cfg.seed)
-
-                    out_clean = self.pipe(
-                        prompt=prompt,
-                        image=clean_pil,
-                        strength=float(strength),
-                        guidance_scale=float(cfg_scale),
-                        num_inference_steps=self.cfg.num_inference_steps,
-                        generator=gen_clean,
-                    ).images[0]
-
-                    out_protected = self.pipe(
-                        prompt=prompt,
-                        image=protected_pil,
-                        strength=float(strength),
-                        guidance_scale=float(cfg_scale),
-                        num_inference_steps=self.cfg.num_inference_steps,
-                        generator=gen_protected,
-                    ).images[0]
-
-                    tag = f"s{strength}_cfg{cfg_scale}_p{idx}"
-                    out_clean.save(os.path.join(save_dir, f"{tag}_clean_edit.png"))
-                    out_protected.save(os.path.join(save_dir, f"{tag}_protected_edit.png"))
-
-        print(f"[*] Validation saved to: {save_dir}")
 
     def train_all(self):
         image_paths = list_images(self.cfg.image_dir, self.cfg.image_extensions)
